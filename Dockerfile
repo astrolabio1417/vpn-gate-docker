@@ -6,9 +6,10 @@ FROM alpine:3.21
 # `--build-arg GOST_VERSION=3.3.0`, which switches to the maintained v3 line
 # at the cost of a 64.6MB image instead of 29.2MB.
 ARG GOST_VERSION=2.12.0
+ARG TARGETARCH
 
 RUN apk add --no-cache openvpn curl \
- && curl -fsSL "https://github.com/ginuerzh/gost/releases/download/v${GOST_VERSION}/gost_${GOST_VERSION}_linux_amd64.tar.gz" \
+ && curl -fsSL "https://github.com/ginuerzh/gost/releases/download/v${GOST_VERSION}/gost_${GOST_VERSION}_linux_${TARGETARCH}.tar.gz" \
     | tar -xz -C /usr/bin gost \
  && chmod +x /usr/bin/gost
 
