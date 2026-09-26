@@ -1,0 +1,28 @@
+services:
+  vpn-gate:
+    build: .
+    image: vpn-gate-docker
+    container_name: vpn-gate
+    restart: always
+    ports:
+      # Localhost only. An unauthenticated SOCKS5 proxy on a routable
+      # interface is an open relay -- see README before widening this.
+      - "127.0.0.1:1080:1080"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    # Queries go to 1.1.1.1 over tun0, so nothing reaches the host resolver.
+    # The server pushes its own DNS, but Alpine has no resolv-conf hook and
+    # ignores it -- that is intentional, not an oversight.
+    dns:
+      - 1.1.1.1
+    environment:
+      # Comma-separated ISO-2 codes, e.g. COUNTRY=JP,US. Empty means best available.
+      - COUNTRY=${COUNTRY:-}
+      - MAX_SERVERS=${MAX_SERVERS:-32}
+      - BLOCKED_IPS=${BLOCKED_IPS:-}
+      - CLAIM_DIR=${CLAIM_DIR:-/var/lib/vpn-gate/claims}
+      - CLAIM_TTL=${CLAIM_TTL:-300}
+      - TOMBSTONE_TTL=${TOMBSTONE_TTL:-900}
+      - CHECK_INTERVAL=${CHECK_INTERVAL:-30}
