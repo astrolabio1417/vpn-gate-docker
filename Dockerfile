@@ -19,6 +19,7 @@ RUN chmod +x /app/generate-config.sh /app/entrypoint.sh /app/healthcheck.sh
 
 ENV COUNTRY="" \
     MAX_SERVERS=32 \
+    BLOCKED_EXIT_IPS="" \
     CLAIM_DIR=/var/lib/vpn-gate/claims \
     CLAIM_TTL=300 \
     TOMBSTONE_TTL=900 \

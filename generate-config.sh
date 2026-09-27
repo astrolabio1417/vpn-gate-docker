@@ -103,16 +103,28 @@ if [ -n "$COUNTRY" ]; then
     fi
 fi
 
-# Exit IPs a target has banned; keep them out of the pool across restarts.
+# Entry IPs (field 2, as the API lists them) an operator wants excluded
+# across restarts. A token ending in "." blocks a subnet prefix instead of
+# one address -- e.g. "219.100.37." for a whole NATed farm.
 if [ -n "$BLOCKED_IPS" ]; then
     printf '%s' "$BLOCKED_IPS" | tr -d ' ' | tr ',' '\n' | sed '/^$/d' > "$work/blocked"
-    awk -F, 'NR==FNR { bad[$1]; next } !($2 in bad)' \
-        "$work/blocked" "$work/rows.csv" > "$work/kept.csv"
-    mv "$work/kept.csv" "$work/rows.csv"
 
-    if [ ! -s "$work/rows.csv" ]; then
-        echo "generate-config: BLOCKED_IPS excluded every server" >&2
-        exit 1
+    # A BLOCKED_IPS value that normalises to nothing (",", " ", ",,") leaves
+    # $work/blocked empty. NR==FNR then never goes false, so the awk below
+    # would treat the whole server list as blocklist entries and print
+    # nothing -- an empty blocklist must be a no-op, not a pool wipe.
+    if [ -s "$work/blocked" ]; then
+        awk -F, 'NR==FNR { bad[FNR]=$1; n=FNR; next }
+                 { for (i=1; i<=n; i++)
+                       if ($2 == bad[i] || (bad[i] ~ /\.$/ && index($2, bad[i]) == 1)) next
+                   print }' \
+            "$work/blocked" "$work/rows.csv" > "$work/kept.csv"
+        mv "$work/kept.csv" "$work/rows.csv"
+
+        if [ ! -s "$work/rows.csv" ]; then
+            echo "generate-config: BLOCKED_IPS excluded every server" >&2
+            exit 1
+        fi
     fi
 fi
 

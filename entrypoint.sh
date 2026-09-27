@@ -8,6 +8,7 @@ OVPN_LOG=/tmp/openvpn.log
 API=https://www.vpngate.net/api/iphone/
 CHECK_INTERVAL="${CHECK_INTERVAL:-30}"
 CHECK_URL="${CHECK_URL:-https://api.ipify.org}"
+BLOCKED_EXIT_IPS="${BLOCKED_EXIT_IPS:-}"
 PROXY_PORT="${PROXY_PORT:-1080}"
 CLAIM_DIR="${CLAIM_DIR:-/var/lib/vpn-gate/claims}"
 
@@ -201,9 +202,46 @@ log "tunnel up via $(current_remote)"
 
 # The default container resolver dies once `redirect-gateway def1` is pushed,
 # so every proxied lookup fails while the tunnel still looks healthy.
-if ! curl -fsS --max-time 15 "$CHECK_URL" > /dev/null 2>&1; then
-    log "WARNING: DNS/connectivity check failed through the tunnel."
-    log "WARNING: run this container with --dns 1.1.1.1 (compose: dns: [1.1.1.1])."
+if [ -z "$BLOCKED_EXIT_IPS" ]; then
+    # Hot default path, unchanged: no BLOCKED_EXIT_IPS means nothing below
+    # ever compares against exit_ip, so one flaky fetch costs nothing.
+    if ! exit_ip=$(curl -fsS --max-time 15 "$CHECK_URL" 2>/dev/null); then
+        log "WARNING: DNS/connectivity check failed through the tunnel."
+        log "WARNING: run this container with --dns 1.1.1.1 (compose: dns: [1.1.1.1])."
+    fi
+else
+    # BLOCKED_EXIT_IPS asks us to refuse specific exits; that promise is
+    # only as good as the exit IP we can confirm, so this path fails
+    # CLOSED instead of open: retry past one transient failure, and if the
+    # exit IP still cannot be confirmed, refuse to serve rather than let an
+    # unverified relay through.
+    attempt=1
+    exit_ip=""
+    while [ "$attempt" -le 3 ]; do
+        exit_ip=$(curl -fsS --max-time 15 "$CHECK_URL" 2>/dev/null) || exit_ip=""
+        exit_ip=$(printf '%s' "$exit_ip" | tr -d ' \t\n\r')
+        if [ -n "$exit_ip" ]; then
+            break
+        fi
+        if [ "$attempt" -lt 3 ]; then
+            sleep 2
+        fi
+        attempt=$((attempt+1))
+    done
+    if [ -z "$exit_ip" ]; then
+        log "WARNING: DNS/connectivity check failed through the tunnel."
+        log "WARNING: run this container with --dns 1.1.1.1 (compose: dns: [1.1.1.1])."
+        give_up "could not determine exit IP after 3 attempts; refusing to serve with BLOCKED_EXIT_IPS set"
+    fi
+fi
+# CHECK_URL is operator-configurable and may not return a bare IP; trim
+# whitespace/newlines so a well-formed body still compares cleanly, and let
+# anything else pass through silently -- it just will not match a blocklist.
+exit_ip=$(printf '%s' "${exit_ip:-}" | tr -d ' \t\n\r')
+
+if [ -n "$exit_ip" ] && [ -n "$BLOCKED_EXIT_IPS" ] && \
+   printf '%s' "$BLOCKED_EXIT_IPS" | tr -d ' ' | tr ',' '\n' | sed '/^$/d' | grep -qxF "$exit_ip"; then
+    give_up "exit IP $exit_ip (via entry $CLAIMED_IP) is blocked; tombstoned so the restart claims another relay"
 fi
 
 start_proxy

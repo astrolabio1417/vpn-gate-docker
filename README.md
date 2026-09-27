@@ -73,10 +73,34 @@ other capabilities are required.
 | `CLAIM_DIR` | `/var/lib/vpn-gate/claims` | Directory that arbitrates which container owns which relay (see "Running several containers"). Container-local by default, so even a single container gets tombstone protection against re-claiming a relay it just watched die. MUST be a local filesystem — `mkdir` atomicity and mtime ordering, which the whole scheme depends on, are not guaranteed on NFS or CIFS. |
 | `CLAIM_TTL` | `300` | Seconds since a claim's last heartbeat before another container may steal it. Should comfortably exceed `CHECK_INTERVAL` (entrypoint heartbeats every second while waiting for the tunnel, then once per `CHECK_INTERVAL` tick after); entrypoint warns at startup if `CHECK_INTERVAL + 15` does not leave enough room, since undershooting lets a sibling judge a live container's claim stale. |
 | `TOMBSTONE_TTL` | `900` | Seconds a relay stays excluded after entrypoint tombstones it for a failure, before another container may retry it. Automatic and expiring — see how this differs from `BLOCKED_IPS` below. |
-| `BLOCKED_IPS` | *(unset)* | Comma-separated exit IPs to keep out of the pool permanently, e.g. a server a scrape target has banned. Operator-set, and survives restarts. A relay that keeps reappearing as a tombstone belongs here instead of waiting out `TOMBSTONE_TTL` forever. |
+| `BLOCKED_IPS` | *(unset)* | Comma-separated relay entry IPs (field 2 of the VPN Gate list) to keep out of the pool permanently. A token ending in `.` blocks a subnet prefix instead of one address, e.g. `219.100.37.` for the whole `public-vpn-*` farm. Operator-set, and survives restarts. A relay that keeps reappearing as a tombstone belongs here instead of waiting out `TOMBSTONE_TTL` forever. |
+| `BLOCKED_EXIT_IPS` | *(unset)* | Comma-separated exit IPs to reject after connecting, once the real exit IP is known. See below for how this differs from `BLOCKED_IPS`. |
 | `CHECK_INTERVAL` | `30` | Seconds between watchdog health checks. |
 | `CHECK_URL` | `https://api.ipify.org` | URL the watchdog probes through the proxy. |
 | `PROXY_PORT` | `1080` | Port gost listens on, inside the container only. The published port is hardcoded in `docker-compose.yml`; changing `PROXY_PORT` alone yields connection-refused on the old port while the healthcheck still passes. |
+
+`BLOCKED_IPS` matches on the entry IP VPN Gate publishes, not the exit
+address a target sees — most relays are 1:1, but VPN Gate's `public-vpn-*`
+farm NATs roughly a dozen relays out through a handful of shared exit IPs
+in `219.100.37.0/24`, none of which appear in the CSV as an entry IP. Banning
+the exit IP a target names blocks nothing. Block the farm's entry-IP prefix
+instead, e.g. `BLOCKED_IPS=219.100.37.`.
+
+`BLOCKED_EXIT_IPS` is the other half: it filters *after* the tunnel is up,
+by the address `CHECK_URL` reports back through it, rather than *before*
+dialing. Use it for an exit IP you cannot pre-filter by entry IP — for
+example a shared NAT exit whose entry IPs you have not enumerated yet. A
+match runs the same `give_up` path as any other failed relay: the proxy
+never starts, and the relay is tombstoned, so the restart claims a
+different one. That tombstone expires after `TOMBSTONE_TTL`, so this alone
+is relief, not a permanent ban — the same relay can be claimed again once it
+expires. Entrypoint logs the entry IP that produced the blocked exit
+(`exit IP ... via entry ...`); put that entry IP in `BLOCKED_IPS` for a
+permanent ban. The comparison is a whole-line exact match, so `CHECK_URL`
+MUST return a bare IP and nothing else — a URL like `https://ipinfo.io/json`
+that answers `{"ip":"1.2.3.4"}` will never match. With `BLOCKED_EXIT_IPS`
+set, a container that cannot determine its exit IP after retrying refuses to
+serve and restarts, rather than serving an unverified exit.
 
 Example with a country filter:
 

@@ -22,6 +22,7 @@ services:
       - COUNTRY=${COUNTRY:-}
       - MAX_SERVERS=${MAX_SERVERS:-32}
       - BLOCKED_IPS=${BLOCKED_IPS:-}
+      - BLOCKED_EXIT_IPS=${BLOCKED_EXIT_IPS:-}
       - CLAIM_DIR=${CLAIM_DIR:-/var/lib/vpn-gate/claims}
       - CLAIM_TTL=${CLAIM_TTL:-300}
       - TOMBSTONE_TTL=${TOMBSTONE_TTL:-900}

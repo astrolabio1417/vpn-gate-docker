@@ -5,7 +5,12 @@ cd "$(dirname "$0")"
 
 NAME=vpn-gate-e2e
 PORT=11080
-cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
+NAME2=vpn-gate-e2e-blocked
+PORT2=11081
+cleanup() {
+    docker rm -f "$NAME" "$NAME2" >/dev/null 2>&1 || true
+    [ -n "${claim_tmp:-}" ] && rm -rf "$claim_tmp" 2>/dev/null || true
+}
 trap cleanup EXIT
 
 fail() { echo "FAIL: $*"; exit 1; }
@@ -72,3 +77,59 @@ echo "live claim(s) on disk: $live_claims"
     fail "live claim '$live_claims' does not match the logged claim '$claimed_from_log'"
 
 echo "PASS: exactly one live claim ($claimed_from_log), and it matches the log"
+
+echo "== BLOCKED_EXIT_IPS: a container that would exit as \"$proxied\" must refuse to serve =="
+# NAME's CLAIM_DIR is container-local, so NAME2 does not see its claim and is
+# free to independently claim the same top-scored JP relay -- usually the
+# same entry IP, hence the same exit IP, giving BLOCKED_EXIT_IPS something to
+# actually match. Bind-mounted so the tombstone is still readable once NAME2
+# has exited (docker exec does not work on a stopped container).
+claim_tmp=$(mktemp -d)
+docker run -d --name "$NAME2" --cap-add NET_ADMIN --device /dev/net/tun \
+    --dns 1.1.1.1 -e COUNTRY=JP -e "BLOCKED_EXIT_IPS=$proxied" \
+    -v "$claim_tmp:/var/lib/vpn-gate/claims" \
+    -p "127.0.0.1:$PORT2:1080" vpn-gate-docker >/dev/null \
+    || fail "second container did not start"
+
+connected=0
+i=0
+while [ "$i" -lt 150 ]; do
+    [ "$(docker inspect -f '{{.State.Running}}' "$NAME2" 2>/dev/null)" = "true" ] || break
+    curl -s --max-time 2 --socks5-hostname "127.0.0.1:$PORT2" https://api.ipify.org >/dev/null 2>&1 \
+        && connected=1
+    i=$((i+3)); sleep 3
+done
+
+if [ "$connected" -eq 1 ]; then
+    # The proxy came up, so NAME2 was not blocked. NAME2 has its own
+    # CLAIM_DIR and often lands on a different relay with a different exit
+    # IP than NAME's -- that is the block correctly NOT firing, not a bug.
+    # Query the exit IP it actually reports and only fail if it truly
+    # matches what BLOCKED_EXIT_IPS was set to.
+    proxied2=$(curl -s --max-time 15 --socks5-hostname "127.0.0.1:$PORT2" https://api.ipify.org)
+    if [ -n "$proxied2" ] && [ "$proxied2" = "$proxied" ]; then
+        fail "blocked-exit-IP container accepted a proxied connection with the blocked exit IP $proxied"
+    fi
+    echo "SKIP: BLOCKED_EXIT_IPS check -- second container landed on a different relay (exit '${proxied2:-<unknown>}' != $proxied)"
+else
+    [ "$(docker inspect -f '{{.State.Running}}' "$NAME2" 2>/dev/null)" != "true" ] || {
+        docker logs "$NAME2" 2>&1 | tail -20; fail "blocked-exit-IP container never exited"; }
+
+    exit_code=$(docker inspect -f '{{.State.ExitCode}}' "$NAME2" 2>/dev/null || echo "")
+    [ -n "$exit_code" ] && [ "$exit_code" != "0" ] || {
+        docker logs "$NAME2" 2>&1 | tail -20
+        fail "blocked-exit-IP container exited with code '${exit_code:-<unknown>}', expected non-zero"; }
+
+    # Any give_up call site produces the same shape (no connection, stopped,
+    # non-zero exit, a tombstone) -- this is the one line that proves the
+    # BLOCKED_EXIT_IPS comparison actually fired, not some unrelated failure.
+    docker logs "$NAME2" 2>&1 | grep -q 'is blocked' || {
+        docker logs "$NAME2" 2>&1 | tail -20
+        fail "container exited but logs do not show a blocked exit IP -- exited for an unrelated reason"; }
+
+    dead=$(find "$claim_tmp" -maxdepth 1 -name '*.dead')
+    [ -n "$dead" ] || {
+        docker logs "$NAME2" 2>&1 | tail -20; fail "no .dead tombstone found after blocked exit IP"; }
+
+    echo "PASS: BLOCKED_EXIT_IPS=$proxied refused to serve and tombstoned its claim"
+fi

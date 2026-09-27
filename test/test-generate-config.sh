@@ -81,6 +81,41 @@ all_ips=$(printf '%s\n' "$sorted_ips" | paste -sd,)
 MAX_SERVERS=32 BLOCKED_IPS="$all_ips" CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv >/dev/null 2>&1; rc=$?
 [ "$rc" -ne 0 ]; check "blocking every server exits non-zero" "$?"
 
+# A blocklist that normalises to empty (",", " ", ",,") must be a no-op,
+# not a pool wipe -- NR==FNR on an empty first file stays true forever.
+d=$(mkclaimdir)
+MAX_SERVERS=32 BLOCKED_IPS="," CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; check "BLOCKED_IPS=',' (normalises to empty) claims normally" "$?"
+
+# Trailing-dot token blocks a whole subnet, not just one IP. The fixture's
+# public-vpn-* farm is entirely 219.100.37.0/24; only the two 203.0.113.x
+# rows survive.
+d=$(mkclaimdir)
+PREFIX=$(MAX_SERVERS=32 BLOCKED_IPS="219.100.37." CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv)
+prefix_ip=$(claimed_ip_of "$PREFIX")
+case "$prefix_ip" in
+    219.100.37.*) leaked=1 ;;
+    *) leaked=0 ;;
+esac
+[ "$leaked" -eq 0 ]; check "trailing-dot BLOCKED_IPS=219.100.37. excludes the whole farm (got $prefix_ip)" "$?"
+
+# A full IP with no trailing dot must match exactly, not as a string prefix:
+# 219.100.37.2 must not also swallow 219.100.37.239. Block every candidate
+# except .239 (including the exact .2 token) so a correct implementation is
+# the only way .239 remains claimable.
+d=$(mkclaimdir)
+all_but_239=$(printf '%s\n' "$sorted_ips" | grep -v '^219\.100\.37\.239$' | paste -sd,)
+NOPFX=$(MAX_SERVERS=32 BLOCKED_IPS="$all_but_239" CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv)
+nopfx_ip=$(claimed_ip_of "$NOPFX")
+[ "$nopfx_ip" = "219.100.37.239" ]; check "full-IP token 219.100.37.2 does not prefix-match 219.100.37.239 (got $nopfx_ip)" "$?"
+
+# The exhaustion error path must still fire when a prefix, not just an
+# enumeration of exact IPs, is what empties the pool.
+d=$(mkclaimdir)
+MAX_SERVERS=32 BLOCKED_IPS="219.100.37.,203.0.113.10,203.0.113.20" CLAIM_DIR="$d" \
+    ./generate-config.sh < test/fixture.csv >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; check "a prefix that empties the pool exits non-zero" "$?"
+
 # COUNTRY filter must run before claiming, not after: the fixture's two
 # highest-scored rows are deliberately non-JP, so a regression that let
 # claiming see the unfiltered pool would hand one of them straight out.
