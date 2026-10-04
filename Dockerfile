@@ -25,7 +25,9 @@ ENV COUNTRY="" \
     TOMBSTONE_TTL=900 \
     CHECK_INTERVAL=30 \
     CHECK_URL=https://api.ipify.org \
-    PROXY_PORT=1080
+    PROXY_PORT=1080 \
+    PROXY_DNS=1.1.1.1:53/tcp,8.8.8.8:53/tcp \
+    PROXY_DNS_TTL=-1s
 
 EXPOSE 1080
 

@@ -10,6 +10,8 @@ CHECK_INTERVAL="${CHECK_INTERVAL:-30}"
 CHECK_URL="${CHECK_URL:-https://api.ipify.org}"
 BLOCKED_EXIT_IPS="${BLOCKED_EXIT_IPS:-}"
 PROXY_PORT="${PROXY_PORT:-1080}"
+PROXY_DNS="${PROXY_DNS:-1.1.1.1:53/tcp,8.8.8.8:53/tcp}"
+PROXY_DNS_TTL="${PROXY_DNS_TTL:--1s}"
 CLAIM_DIR="${CLAIM_DIR:-/var/lib/vpn-gate/claims}"
 
 ovpn_pid=""
@@ -176,7 +178,7 @@ wait_for_tunnel() {
 }
 
 start_proxy() {
-    gost -L ":$PROXY_PORT" &
+    gost -L ":$PROXY_PORT?dns=$PROXY_DNS&ttl=$PROXY_DNS_TTL" &
     gost_pid=$!
     log "proxy listening on :$PROXY_PORT (pid $gost_pid)"
 }

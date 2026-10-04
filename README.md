@@ -50,11 +50,12 @@ claim. `docker-compose.yml` uses `restart: always` for the same reason,
 though the two policies differ after a manual `docker stop` or a daemon
 restart.
 
-Without `--dns 1.1.1.1` the proxy returns nothing at all. Once the VPN
-server pushes its route, the container's default resolver is no longer
-reachable, so every DNS lookup through the proxy fails, even though the
-tunnel itself looks healthy. `docker-compose.yml` already sets this; a bare
-`docker run` does not.
+Without `--dns 1.1.1.1` the entrypoint cannot confirm the exit IP. Once
+the VPN server pushes its route, the container's default resolver is no
+longer reachable, so the entrypoint's direct `curl` to `CHECK_URL` fails.
+With `BLOCKED_EXIT_IPS` set, the container then refuses to serve. Proxied
+lookups are unaffected: gost resolves them through `PROXY_DNS`.
+`docker-compose.yml` already sets this; a bare `docker run` does not.
 
 ## Requirements
 
@@ -77,6 +78,8 @@ other capabilities are required.
 | `BLOCKED_EXIT_IPS` | *(unset)* | Comma-separated exit IPs to reject after connecting, once the real exit IP is known. See below for how this differs from `BLOCKED_IPS`. |
 | `CHECK_INTERVAL` | `30` | Seconds between watchdog health checks. |
 | `CHECK_URL` | `https://api.ipify.org` | URL the watchdog probes through the proxy. |
+| `PROXY_DNS` | `1.1.1.1:53/tcp,8.8.8.8:53/tcp` | Comma-separated `addr/proto` resolvers gost uses for proxied lookups. SHOULD use `/tcp`, since a lossy relay drops lone UDP queries. |
+| `PROXY_DNS_TTL` | `-1s` | gost DNS cache TTL. Negative disables the cache. MUST NOT be `0`: failures never expire. A positive value caches failures too, so keep it below `CHECK_INTERVAL`. |
 | `PROXY_PORT` | `1080` | Port gost listens on, inside the container only. The published port is hardcoded in `docker-compose.yml`; changing `PROXY_PORT` alone yields connection-refused on the old port while the healthcheck still passes. |
 
 `BLOCKED_IPS` matches on the entry IP VPN Gate publishes, not the exit
