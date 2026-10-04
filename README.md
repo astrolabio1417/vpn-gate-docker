@@ -116,8 +116,8 @@ COUNTRY=JP docker compose up -d
 There is no in-process failover: the config carries exactly one `remote`, so
 if it dies, openvpn has nothing to fall back to on its own. Every failure —
 the initial connect never completing, openvpn exiting once its own
-`connect-retry-max 3` is exhausted, or the watchdog's three consecutive
-failed proxy checks — makes the container exit non-zero. A restart policy is
+`connect-retry-max 3` is exhausted, or the watchdog seeing 3 of the last 5
+proxy checks fail — makes the container exit non-zero. A restart policy is
 therefore MANDATORY (see "Plain `docker run`" above), not just recommended:
 without one, a single dead relay leaves the container permanently down.
 
@@ -128,7 +128,7 @@ immediately re-claim the relay that just killed it.
 
 The watchdog is the backstop for the case openvpn cannot see for itself: the
 tunnel stays up and authenticated while traffic quietly goes nowhere. Three
-consecutive failed checks are treated the same as openvpn exiting outright —
+failed checks among the last five are treated the same as openvpn exiting outright —
 both end in the container exiting so a fresh claim gets made.
 
 ## Running several containers
@@ -247,4 +247,5 @@ Offline unit tests for the config generator (no network, no privileges):
 
 ```bash
 ./test/test-generate-config.sh
+./test/test-watchdog-window.sh
 ```

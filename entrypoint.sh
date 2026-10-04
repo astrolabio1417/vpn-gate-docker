@@ -196,6 +196,13 @@ current_remote() {
         | tail -1 | sed 's/.*\]//'
 }
 
+record_check() {
+    hist="$hist$1"
+    [ "${#hist}" -le 5 ] || hist=${hist#?}
+    fails=$(printf %s "$hist" | tr -d P)
+    fails=${#fails}
+}
+
 start_openvpn
 if ! wait_for_tunnel; then
     give_up "no server came up; exiting so a fresh list and a fresh claim are made"
@@ -248,7 +255,7 @@ fi
 
 start_proxy
 
-fails=0
+hist=""
 while :; do
     # busybox ash defers a trap until a foreground child exits; backgrounding
     # lets `wait` return as soon as TERM/INT fires instead of after CHECK_INTERVAL.
@@ -272,12 +279,12 @@ while :; do
 
     if curl -fsS --max-time 10 --socks5-hostname "127.0.0.1:$PROXY_PORT" \
             "$CHECK_URL" > /dev/null 2>&1; then
-        fails=0
+        record_check P
         continue
     fi
-    fails=$((fails+1))
-    log "proxy check failed ($fails/3)"
+    record_check F
+    log "proxy check failed ($fails/3 in last 5)"
     if [ "$fails" -ge 3 ]; then
-        give_up "proxy checks failed 3 times in a row; exiting so a fresh claim is made"
+        give_up "proxy checks failed 3 of the last 5; exiting so a fresh claim is made"
     fi
 done

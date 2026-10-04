@@ -17,6 +17,7 @@ fail() { echo "FAIL: $*"; exit 1; }
 
 echo "== offline generator tests =="
 ./test/test-generate-config.sh || fail "generator tests failed"
+./test/test-watchdog-window.sh || fail "watchdog window tests failed"
 
 echo "== building =="
 docker build -q -t vpn-gate-docker . >/dev/null || fail "build failed"
