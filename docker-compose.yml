@@ -21,6 +21,7 @@ services:
       # Comma-separated ISO-2 codes, e.g. COUNTRY=JP,US. Empty means best available.
       - COUNTRY=${COUNTRY:-}
       - MAX_SERVERS=${MAX_SERVERS:-32}
+      - SORT_BY=${SORT_BY:-score}
       - BLOCKED_IPS=${BLOCKED_IPS:-}
       - BLOCKED_EXIT_IPS=${BLOCKED_EXIT_IPS:-}
       - CLAIM_DIR=${CLAIM_DIR:-/var/lib/vpn-gate/claims}

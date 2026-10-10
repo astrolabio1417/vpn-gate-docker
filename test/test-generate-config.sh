@@ -5,6 +5,7 @@
 # never leak between assertions and no test ever touches /var/lib.
 set -u
 cd "$(dirname "$0")/.."
+unset SORT_BY
 
 pass=0; fail=0
 check() { # check <description> <condition-result>
@@ -27,6 +28,7 @@ claimed_ip_of() { printf '%s\n' "$1" | grep -m1 '^# claimed ' | awk '{ print $3 
 
 sorted_ips=$(awk -F, 'NF==15 && $1 !~ /^[*#]/' test/fixture.csv | sort -t, -k3,3 -nr | cut -d, -f2)
 top_ip=$(printf '%s\n' "$sorted_ips" | sed -n '1p')
+speed_ips=$(awk -F, 'NF==15 && $1 !~ /^[*#]/' test/fixture.csv | sort -t, -k5,5nr -k3,3nr | cut -d, -f2)
 
 d=$(mkclaimdir)
 OUT=$(MAX_SERVERS=5 COUNTRY= CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv); rc=$?
@@ -136,6 +138,67 @@ mkdir -p "$d/$top_ip"
 : > "$d/$top_ip/beat"
 MAX_SERVERS=1 CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv >/dev/null 2>&1; rc=$?
 [ "$rc" -ne 0 ]; check "MAX_SERVERS caps the pool (top claimed, MAX_SERVERS=1 can't reach row 2)" "$?"
+
+# --- SORT_BY ---
+
+for sb in unset '' score; do
+    d=$(mkclaimdir)
+    if [ "$sb" = unset ]; then
+        sb_out=$(MAX_SERVERS=32 CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv)
+    else
+        sb_out=$(SORT_BY="$sb" MAX_SERVERS=32 CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv)
+    fi
+    sb_ip=$(claimed_ip_of "$sb_out")
+    [ "$sb_ip" = "203.0.113.10" ]; check "SORT_BY=${sb:-<empty>} ranks by score (got $sb_ip)" "$?"
+done
+
+d=$(mkclaimdir)
+sb_out=$(SORT_BY=speed MAX_SERVERS=32 CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv)
+sb_ip=$(claimed_ip_of "$sb_out")
+[ "$sb_ip" = "219.100.37.178" ]; check "SORT_BY=speed claims the fastest relay (got $sb_ip)" "$?"
+
+d=$(mkclaimdir)
+sb_out=$(SORT_BY=speed COUNTRY=JP MAX_SERVERS=32 CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv)
+sb_ip=$(claimed_ip_of "$sb_out")
+[ "$sb_ip" = "219.100.37.178" ]; check "SORT_BY=speed with COUNTRY=JP claims the fastest JP relay (got $sb_ip)" "$?"
+
+d=$(mkclaimdir)
+sb_out=$(SORT_BY=speed BLOCKED_IPS=219.100.37.178 MAX_SERVERS=32 CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv)
+sb_ip=$(claimed_ip_of "$sb_out")
+[ "$sb_ip" = "$(printf '%s\n' "$speed_ips" | sed -n '2p')" ]; check "SORT_BY=speed still honours BLOCKED_IPS (got $sb_ip)" "$?"
+
+d=$(mkclaimdir)
+mkdir -p "$d/219.100.37.178"
+: > "$d/219.100.37.178/beat"
+SORT_BY=speed MAX_SERVERS=1 CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; check "SORT_BY=speed MAX_SERVERS=1 cannot reach past the fastest relay" "$?"
+
+d=$(mkclaimdir)
+sb_seq=""
+i=0
+while [ "$i" -lt 6 ]; do
+    sb_out=$(SORT_BY=speed MAX_SERVERS=32 CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv)
+    sb_seq="$sb_seq$(claimed_ip_of "$sb_out")
+"
+    i=$((i+1))
+done
+sb_seq=$(printf '%s\n' "$sb_seq" | sed '/^$/d')
+sb_distinct=$(printf '%s\n' "$sb_seq" | sort -u | wc -l)
+ok=1
+[ "$sb_distinct" -eq 6 ] || ok=0
+[ "$sb_seq" = "$(printf '%s\n' "$speed_ips" | head -6)" ] || ok=0
+[ "$ok" -eq 1 ]; check "6 sequential SORT_BY=speed runs claim 6 distinct relays in Speed order (distinct=$sb_distinct)" "$?"
+
+for sb in ping Speed foo; do
+    d="$scratch/sortby-$sb"
+    sb_out=$(SORT_BY="$sb" MAX_SERVERS=32 CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv 2>"$scratch/sortby-$sb.err"); rc=$?
+    ok=1
+    [ "$rc" -ne 0 ] || ok=0
+    [ -z "$sb_out" ] || ok=0
+    grep -q "SORT_BY='$sb'" "$scratch/sortby-$sb.err" || ok=0
+    [ ! -e "$d" ] || ok=0
+    [ "$ok" -eq 1 ]; check "SORT_BY=$sb fails before touching CLAIM_DIR" "$?"
+done
 
 # --- claim/steal/tombstone mechanics ---
 

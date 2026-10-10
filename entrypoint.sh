@@ -130,7 +130,7 @@ if ! curl -fsS --max-time 60 "$API" -o /tmp/vpngate.csv; then
     exit 1
 fi
 
-log "generating config (COUNTRY='${COUNTRY:-any}' MAX_SERVERS=${MAX_SERVERS:-32} CLAIM_DIR='$CLAIM_DIR')"
+log "generating config (COUNTRY='${COUNTRY:-any}' SORT_BY=${SORT_BY:-score} MAX_SERVERS=${MAX_SERVERS:-32} CLAIM_DIR='$CLAIM_DIR')"
 if ! /app/generate-config.sh < /tmp/vpngate.csv > "$CONF"; then
     log "ERROR: could not claim a relay (see generate-config.sh output above)"
     exit 1
