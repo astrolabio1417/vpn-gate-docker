@@ -6,7 +6,7 @@ No account, no credentials, no configuration required. Image size is 29.2 MB
 (Alpine 3.21, OpenVPN 2.6.20, gost 2.12.0).
 
 VPN Gate's public API lists roughly 100 volunteer-run servers. The container
-downloads that list, ranks servers by the service's own Score field, and
+downloads that list, ranks servers by the service's own Score field (or its published Speed, with `SORT_BY=speed`), and
 claims exactly one relay for its lifetime — see "Running several containers"
 below for what that means when you run more than one of these. A cold start
 takes about 20 seconds.
@@ -70,7 +70,8 @@ other capabilities are required.
 | Variable | Default | Meaning |
 |---|---|---|
 | `COUNTRY` | *(unset)* | Comma-separated ISO-2 codes, e.g. `JP,US` or `JP, US` — spaces are tolerated. Unset means best available. |
-| `MAX_SERVERS` | `32` | How far down the score-ranked list a container may walk looking for a relay it can claim. MUST exceed your container count with real margin — N containers racing for relays need at least N candidates within this window, or the extras exit with nothing left to try even though claimable relays exist further down VPN Gate's real list. |
+| `MAX_SERVERS` | `32` | How far down the ranked list (see `SORT_BY`) a container may walk looking for a relay it can claim. MUST exceed your container count with real margin — N containers racing for relays need at least N candidates within this window, or the extras exit with nothing left to try even though claimable relays exist further down VPN Gate's real list. |
+| `SORT_BY` | `score` | Candidate order: `score` (VPN Gate's Score, descending) or `speed` (VPN Gate's published Speed, descending, Score breaking ties). Any other value, including `Speed`, MUST fail the container at startup. Speed is reported by VPN Gate, not measured from your location, so it MAY not match the throughput you see. |
 | `CLAIM_DIR` | `/var/lib/vpn-gate/claims` | Directory that arbitrates which container owns which relay (see "Running several containers"). Container-local by default, so even a single container gets tombstone protection against re-claiming a relay it just watched die. MUST be a local filesystem — `mkdir` atomicity and mtime ordering, which the whole scheme depends on, are not guaranteed on NFS or CIFS. |
 | `CLAIM_TTL` | `300` | Seconds since a claim's last heartbeat before another container may steal it. Should comfortably exceed `CHECK_INTERVAL` (entrypoint heartbeats every second while waiting for the tunnel, then once per `CHECK_INTERVAL` tick after); entrypoint warns at startup if `CHECK_INTERVAL + 15` does not leave enough room, since undershooting lets a sibling judge a live container's claim stale. |
 | `TOMBSTONE_TTL` | `900` | Seconds a relay stays excluded after entrypoint tombstones it for a failure, before another container may retry it. Automatic and expiring — see how this differs from `BLOCKED_IPS` below. |
@@ -133,7 +134,7 @@ both end in the container exiting so a fresh claim gets made.
 
 ## Running several containers
 
-Each container claims exactly one relay, by score, through `CLAIM_DIR`. On a
+Each container claims exactly one relay, in `SORT_BY` order, through `CLAIM_DIR`. On a
 single host, N containers sharing ONE bind-mounted `CLAIM_DIR` get distinct
 relays via `mkdir`, which is atomic: two containers racing for the same IP,
 including two racing to steal the same stale claim, cannot both win it —
@@ -151,7 +152,7 @@ owner's live claim.
 
 Omitting the shared mount does not fail loudly. Each container silently gets
 its own private, container-local `CLAIM_DIR`, and every container claims the
-same top-scored relay — exactly as if there were no coordination at all. This
+same top-ranked relay — exactly as if there were no coordination at all. This
 is the one part of "fail loudly" that cannot be a hard error, because a
 single container's `CLAIM_DIR` is deliberately container-local too, and that
 default must keep working. The one signal you get is the `NOTE ... is not a

@@ -1,6 +1,6 @@
 #!/bin/sh
 # VPN Gate CSV on stdin -> OpenVPN config on stdout.
-# Emits exactly ONE remote: the highest-scoring relay this process can claim
+# Emits exactly ONE remote: the highest-ranked relay (by SORT_BY) this process can claim
 # under CLAIM_DIR (see README). A second remote would let openvpn's own
 # connect-retry dial a sibling container's already-claimed relay, so
 # multi-container distinctness depends entirely on the claim made here, not
@@ -9,6 +9,7 @@ set -eu
 
 COUNTRY="${COUNTRY:-}"
 MAX_SERVERS="${MAX_SERVERS:-32}"
+SORT_BY="${SORT_BY:-score}"
 BLOCKED_IPS="${BLOCKED_IPS:-}"
 CLAIM_DIR="${CLAIM_DIR:-/var/lib/vpn-gate/claims}"
 CLAIM_TTL="${CLAIM_TTL:-300}"
@@ -17,6 +18,15 @@ TOMBSTONE_TTL="${TOMBSTONE_TTL:-900}"
 case "$MAX_SERVERS" in
     ''|*[!0-9]*)
         echo "generate-config: MAX_SERVERS='$MAX_SERVERS' must be a non-negative integer" >&2
+        exit 1
+        ;;
+esac
+
+case "$SORT_BY" in
+    score) sort_keys="-k3,3 -nr" ;;
+    speed) sort_keys="-k5,5nr -k3,3nr" ;;
+    *)
+        echo "generate-config: SORT_BY='$SORT_BY' must be score or speed" >&2
         exit 1
         ;;
 esac
@@ -128,11 +138,11 @@ if [ -n "$BLOCKED_IPS" ]; then
     fi
 fi
 
-# Column 3 is Score. MAX_SERVERS is how far down this list a container may
+# Column 3 is Score, column 5 is Speed; SORT_BY picks the key. MAX_SERVERS is how far down this list a container may
 # walk looking for a claimable relay -- it MUST exceed the container count
 # with margin, or siblings run out of candidates before they run out of
 # rivals.
-sort -t, -k3,3 -nr "$work/rows.csv" | head -n "$MAX_SERVERS" > "$work/top.csv"
+sort -t, $sort_keys "$work/rows.csv" | head -n "$MAX_SERVERS" > "$work/top.csv"
 
 # mtime of $1, in whole seconds. Falls back from GNU/busybox `stat -c %Y` to
 # `date -r`; either missing mtime (the path vanished mid-check) or a future
