@@ -6,7 +6,7 @@ No account, no credentials, no configuration required. Image size is 29.2 MB
 (Alpine 3.21, OpenVPN 2.6.20, gost 2.12.0).
 
 VPN Gate's public API lists roughly 100 volunteer-run servers. The container
-downloads that list, ranks servers by the service's own Score field, and
+downloads that list, ranks servers by the service's own Score field (or its published Speed, with `SORT_BY=speed`), and
 claims exactly one relay for its lifetime — see "Running several containers"
 below for what that means when you run more than one of these. A cold start
 takes about 20 seconds.
@@ -50,11 +50,12 @@ claim. `docker-compose.yml` uses `restart: always` for the same reason,
 though the two policies differ after a manual `docker stop` or a daemon
 restart.
 
-Without `--dns 1.1.1.1` the proxy returns nothing at all. Once the VPN
-server pushes its route, the container's default resolver is no longer
-reachable, so every DNS lookup through the proxy fails, even though the
-tunnel itself looks healthy. `docker-compose.yml` already sets this; a bare
-`docker run` does not.
+Without `--dns 1.1.1.1` the entrypoint cannot confirm the exit IP. Once
+the VPN server pushes its route, the container's default resolver is no
+longer reachable, so the entrypoint's direct `curl` to `CHECK_URL` fails.
+With `BLOCKED_EXIT_IPS` set, the container then refuses to serve. Proxied
+lookups are unaffected: gost resolves them through `PROXY_DNS`.
+`docker-compose.yml` already sets this; a bare `docker run` does not.
 
 ## Requirements
 
@@ -69,14 +70,42 @@ other capabilities are required.
 | Variable | Default | Meaning |
 |---|---|---|
 | `COUNTRY` | *(unset)* | Comma-separated ISO-2 codes, e.g. `JP,US` or `JP, US` — spaces are tolerated. Unset means best available. |
-| `MAX_SERVERS` | `32` | How far down the score-ranked list a container may walk looking for a relay it can claim. MUST exceed your container count with real margin — N containers racing for relays need at least N candidates within this window, or the extras exit with nothing left to try even though claimable relays exist further down VPN Gate's real list. |
+| `MAX_SERVERS` | `32` | How far down the ranked list (see `SORT_BY`) a container may walk looking for a relay it can claim. MUST exceed your container count with real margin — N containers racing for relays need at least N candidates within this window, or the extras exit with nothing left to try even though claimable relays exist further down VPN Gate's real list. |
+| `SORT_BY` | `score` | Candidate order: `score` (VPN Gate's Score, descending) or `speed` (VPN Gate's published Speed, descending, Score breaking ties). Any other value, including `Speed`, MUST fail the container at startup. Speed is reported by VPN Gate, not measured from your location, so it MAY not match the throughput you see. |
+| `SERVER_LIST_URLS` | official API, then the mirror via GitHub Raw, then jsDelivr | Comma-separated list URLs, tried in order. The first one that returns a VPN Gate CSV wins. Mirrors are third-party and only as fresh as their last successful fetch of VPN Gate. jsDelivr `@latest` MAY serve a copy days old. Set it to just the official URL (`https://www.vpngate.net/api/iphone/`) to opt out of mirrors. |
 | `CLAIM_DIR` | `/var/lib/vpn-gate/claims` | Directory that arbitrates which container owns which relay (see "Running several containers"). Container-local by default, so even a single container gets tombstone protection against re-claiming a relay it just watched die. MUST be a local filesystem — `mkdir` atomicity and mtime ordering, which the whole scheme depends on, are not guaranteed on NFS or CIFS. |
 | `CLAIM_TTL` | `300` | Seconds since a claim's last heartbeat before another container may steal it. Should comfortably exceed `CHECK_INTERVAL` (entrypoint heartbeats every second while waiting for the tunnel, then once per `CHECK_INTERVAL` tick after); entrypoint warns at startup if `CHECK_INTERVAL + 15` does not leave enough room, since undershooting lets a sibling judge a live container's claim stale. |
 | `TOMBSTONE_TTL` | `900` | Seconds a relay stays excluded after entrypoint tombstones it for a failure, before another container may retry it. Automatic and expiring — see how this differs from `BLOCKED_IPS` below. |
-| `BLOCKED_IPS` | *(unset)* | Comma-separated exit IPs to keep out of the pool permanently, e.g. a server a scrape target has banned. Operator-set, and survives restarts. A relay that keeps reappearing as a tombstone belongs here instead of waiting out `TOMBSTONE_TTL` forever. |
+| `BLOCKED_IPS` | *(unset)* | Comma-separated relay entry IPs (field 2 of the VPN Gate list) to keep out of the pool permanently. A token ending in `.` blocks a subnet prefix instead of one address, e.g. `219.100.37.` for the whole `public-vpn-*` farm. Operator-set, and survives restarts. A relay that keeps reappearing as a tombstone belongs here instead of waiting out `TOMBSTONE_TTL` forever. |
+| `BLOCKED_EXIT_IPS` | *(unset)* | Comma-separated exit IPs to reject after connecting, once the real exit IP is known. See below for how this differs from `BLOCKED_IPS`. |
 | `CHECK_INTERVAL` | `30` | Seconds between watchdog health checks. |
 | `CHECK_URL` | `https://api.ipify.org` | URL the watchdog probes through the proxy. |
+| `PROXY_DNS` | `1.1.1.1:53/tcp,8.8.8.8:53/tcp` | Comma-separated `addr/proto` resolvers gost uses for proxied lookups. SHOULD use `/tcp`, since a lossy relay drops lone UDP queries. |
+| `PROXY_DNS_TTL` | `-1s` | gost DNS cache TTL. Negative disables the cache. MUST NOT be `0`: failures never expire. A positive value caches failures too, so keep it below `CHECK_INTERVAL`. |
 | `PROXY_PORT` | `1080` | Port gost listens on, inside the container only. The published port is hardcoded in `docker-compose.yml`; changing `PROXY_PORT` alone yields connection-refused on the old port while the healthcheck still passes. |
+
+`BLOCKED_IPS` matches on the entry IP VPN Gate publishes, not the exit
+address a target sees — most relays are 1:1, but VPN Gate's `public-vpn-*`
+farm NATs roughly a dozen relays out through a handful of shared exit IPs
+in `219.100.37.0/24`, none of which appear in the CSV as an entry IP. Banning
+the exit IP a target names blocks nothing. Block the farm's entry-IP prefix
+instead, e.g. `BLOCKED_IPS=219.100.37.`.
+
+`BLOCKED_EXIT_IPS` is the other half: it filters *after* the tunnel is up,
+by the address `CHECK_URL` reports back through it, rather than *before*
+dialing. Use it for an exit IP you cannot pre-filter by entry IP — for
+example a shared NAT exit whose entry IPs you have not enumerated yet. A
+match runs the same `give_up` path as any other failed relay: the proxy
+never starts, and the relay is tombstoned, so the restart claims a
+different one. That tombstone expires after `TOMBSTONE_TTL`, so this alone
+is relief, not a permanent ban — the same relay can be claimed again once it
+expires. Entrypoint logs the entry IP that produced the blocked exit
+(`exit IP ... via entry ...`); put that entry IP in `BLOCKED_IPS` for a
+permanent ban. The comparison is a whole-line exact match, so `CHECK_URL`
+MUST return a bare IP and nothing else — a URL like `https://ipinfo.io/json`
+that answers `{"ip":"1.2.3.4"}` will never match. With `BLOCKED_EXIT_IPS`
+set, a container that cannot determine its exit IP after retrying refuses to
+serve and restarts, rather than serving an unverified exit.
 
 Example with a country filter:
 
@@ -89,8 +118,8 @@ COUNTRY=JP docker compose up -d
 There is no in-process failover: the config carries exactly one `remote`, so
 if it dies, openvpn has nothing to fall back to on its own. Every failure —
 the initial connect never completing, openvpn exiting once its own
-`connect-retry-max 3` is exhausted, or the watchdog's three consecutive
-failed proxy checks — makes the container exit non-zero. A restart policy is
+`connect-retry-max 3` is exhausted, or the watchdog seeing 3 of the last 5
+proxy checks fail — makes the container exit non-zero. A restart policy is
 therefore MANDATORY (see "Plain `docker run`" above), not just recommended:
 without one, a single dead relay leaves the container permanently down.
 
@@ -101,12 +130,12 @@ immediately re-claim the relay that just killed it.
 
 The watchdog is the backstop for the case openvpn cannot see for itself: the
 tunnel stays up and authenticated while traffic quietly goes nowhere. Three
-consecutive failed checks are treated the same as openvpn exiting outright —
+failed checks among the last five are treated the same as openvpn exiting outright —
 both end in the container exiting so a fresh claim gets made.
 
 ## Running several containers
 
-Each container claims exactly one relay, by score, through `CLAIM_DIR`. On a
+Each container claims exactly one relay, in `SORT_BY` order, through `CLAIM_DIR`. On a
 single host, N containers sharing ONE bind-mounted `CLAIM_DIR` get distinct
 relays via `mkdir`, which is atomic: two containers racing for the same IP,
 including two racing to steal the same stale claim, cannot both win it —
@@ -124,7 +153,7 @@ owner's live claim.
 
 Omitting the shared mount does not fail loudly. Each container silently gets
 its own private, container-local `CLAIM_DIR`, and every container claims the
-same top-scored relay — exactly as if there were no coordination at all. This
+same top-ranked relay — exactly as if there were no coordination at all. This
 is the one part of "fail loudly" that cannot be a hard error, because a
 single container's `CLAIM_DIR` is deliberately container-local too, and that
 default must keep working. The one signal you get is the `NOTE ... is not a
@@ -220,4 +249,5 @@ Offline unit tests for the config generator (no network, no privileges):
 
 ```bash
 ./test/test-generate-config.sh
+./test/test-watchdog-window.sh
 ```

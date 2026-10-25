@@ -1,6 +1,6 @@
 #!/bin/sh
 # VPN Gate CSV on stdin -> OpenVPN config on stdout.
-# Emits exactly ONE remote: the highest-scoring relay this process can claim
+# Emits exactly ONE remote: the highest-ranked relay (by SORT_BY) this process can claim
 # under CLAIM_DIR (see README). A second remote would let openvpn's own
 # connect-retry dial a sibling container's already-claimed relay, so
 # multi-container distinctness depends entirely on the claim made here, not
@@ -9,6 +9,7 @@ set -eu
 
 COUNTRY="${COUNTRY:-}"
 MAX_SERVERS="${MAX_SERVERS:-32}"
+SORT_BY="${SORT_BY:-score}"
 BLOCKED_IPS="${BLOCKED_IPS:-}"
 CLAIM_DIR="${CLAIM_DIR:-/var/lib/vpn-gate/claims}"
 CLAIM_TTL="${CLAIM_TTL:-300}"
@@ -17,6 +18,15 @@ TOMBSTONE_TTL="${TOMBSTONE_TTL:-900}"
 case "$MAX_SERVERS" in
     ''|*[!0-9]*)
         echo "generate-config: MAX_SERVERS='$MAX_SERVERS' must be a non-negative integer" >&2
+        exit 1
+        ;;
+esac
+
+case "$SORT_BY" in
+    score) sort_keys="-k3,3 -nr" ;;
+    speed) sort_keys="-k5,5nr -k3,3nr" ;;
+    *)
+        echo "generate-config: SORT_BY='$SORT_BY' must be score or speed" >&2
         exit 1
         ;;
 esac
@@ -103,24 +113,36 @@ if [ -n "$COUNTRY" ]; then
     fi
 fi
 
-# Exit IPs a target has banned; keep them out of the pool across restarts.
+# Entry IPs (field 2, as the API lists them) an operator wants excluded
+# across restarts. A token ending in "." blocks a subnet prefix instead of
+# one address -- e.g. "219.100.37." for a whole NATed farm.
 if [ -n "$BLOCKED_IPS" ]; then
     printf '%s' "$BLOCKED_IPS" | tr -d ' ' | tr ',' '\n' | sed '/^$/d' > "$work/blocked"
-    awk -F, 'NR==FNR { bad[$1]; next } !($2 in bad)' \
-        "$work/blocked" "$work/rows.csv" > "$work/kept.csv"
-    mv "$work/kept.csv" "$work/rows.csv"
 
-    if [ ! -s "$work/rows.csv" ]; then
-        echo "generate-config: BLOCKED_IPS excluded every server" >&2
-        exit 1
+    # A BLOCKED_IPS value that normalises to nothing (",", " ", ",,") leaves
+    # $work/blocked empty. NR==FNR then never goes false, so the awk below
+    # would treat the whole server list as blocklist entries and print
+    # nothing -- an empty blocklist must be a no-op, not a pool wipe.
+    if [ -s "$work/blocked" ]; then
+        awk -F, 'NR==FNR { bad[FNR]=$1; n=FNR; next }
+                 { for (i=1; i<=n; i++)
+                       if ($2 == bad[i] || (bad[i] ~ /\.$/ && index($2, bad[i]) == 1)) next
+                   print }' \
+            "$work/blocked" "$work/rows.csv" > "$work/kept.csv"
+        mv "$work/kept.csv" "$work/rows.csv"
+
+        if [ ! -s "$work/rows.csv" ]; then
+            echo "generate-config: BLOCKED_IPS excluded every server" >&2
+            exit 1
+        fi
     fi
 fi
 
-# Column 3 is Score. MAX_SERVERS is how far down this list a container may
+# Column 3 is Score, column 5 is Speed; SORT_BY picks the key. MAX_SERVERS is how far down this list a container may
 # walk looking for a claimable relay -- it MUST exceed the container count
 # with margin, or siblings run out of candidates before they run out of
 # rivals.
-sort -t, -k3,3 -nr "$work/rows.csv" | head -n "$MAX_SERVERS" > "$work/top.csv"
+sort -t, $sort_keys "$work/rows.csv" | head -n "$MAX_SERVERS" > "$work/top.csv"
 
 # mtime of $1, in whole seconds. Falls back from GNU/busybox `stat -c %Y` to
 # `date -r`; either missing mtime (the path vanished mid-check) or a future
@@ -286,46 +308,49 @@ claim_ip() {
 }
 
 claimed_ip=""
-remote_line=""
 while IFS= read -r row; do
     ip=$(printf '%s' "$row" | cut -d, -f2)
 
     # CSV data must never name a path. A malformed IP field is skipped, not
     # sanitized -- there is no safe way to claim a path we cannot trust.
-    if ! printf '%s' "$ip" | grep -Eq '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'; then
+    if ! printf '%s' "$ip" | grep -Eq '^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$'; then
         continue
     fi
 
     is_tombstoned "$ip" && continue
-    claim_ip "$ip" || continue
 
     printf '%s' "$row" | cut -d, -f15 | base64 -d 2>/dev/null | tr -d '\r' \
         > "$work/one.ovpn" 2>/dev/null || true
 
-    hp=""
-    pr=""
-    if [ -s "$work/one.ovpn" ]; then
-        # Protocols are mixed across servers; never assume tcp.
-        hp=$(awk '/^remote /{ print $2" "$3; exit }' "$work/one.ovpn")
-        pr=$(awk '/^proto /{ print tolower($2); exit }' "$work/one.ovpn")
-    fi
+    awk -v ip="$ip" '
+        tag != "" {
+            if ($0 == ("</" tag ">")) { blk[tag] = blk[tag] $0 "\n"; tag = ""; next }
+            if ($0 ~ /^-----(BEGIN|END) [A-Z ]+-----$/ || $0 ~ "^[A-Za-z0-9+/=]*$") { blk[tag] = blk[tag] $0 "\n"; next }
+            bad = 1; exit
+        }
+        /^<(ca|cert|key)>$/ {
+            tag = substr($0, 2, length($0) - 2)
+            if (tag in blk) { bad = 1; exit }
+            blk[tag] = $0 "\n"; next
+        }
+        /^remote / && host == "" { host = $2; port = $3 }
+        /^proto / && proto == "" { proto = tolower($2) }
+        END {
+            if (bad || tag != "" || host != ip || port !~ /^[0-9]+$/ || (proto != "tcp" && proto != "udp")) exit 1
+            if (!("ca" in blk) || !("cert" in blk) || !("key" in blk)) exit 1
+            print "remote " host " " port " " proto
+            print ""
+            printf "%s%s%s", blk["ca"], blk["cert"], blk["key"]
+        }' "$work/one.ovpn" > "$work/tail" || continue
 
-    if [ -z "$hp" ] || [ -z "$pr" ]; then
-        # Our decode failed, not the relay -- release rather than
-        # tombstone, since a tombstone is a claim about relay health.
-        rm -rf "$CLAIM_DIR/$ip" 2>/dev/null || true
-        continue
-    fi
-
+    claim_ip "$ip" || continue
     claimed_ip="$ip"
     owner_token=$(cat "$CLAIM_DIR/$ip/owner" 2>/dev/null) || owner_token=""
-    remote_line="remote $hp $pr"
-    cp "$work/one.ovpn" "$work/certs.ovpn"
     break
 done < "$work/top.csv"
 
 if [ -z "$claimed_ip" ]; then
-    echo "generate-config: could not claim a relay -- every candidate in the top $MAX_SERVERS was tombstoned, held by another container, or undecodable" >&2
+    echo "generate-config: could not claim a relay -- every candidate in the top $MAX_SERVERS was tombstoned, held by another container, or invalid" >&2
     exit 1
 fi
 
@@ -355,9 +380,4 @@ verb 3
 HEADER
 
 echo
-echo "$remote_line"
-echo
-# All servers ship an identical CA/cert/key.
-for tag in ca cert key; do
-    sed -n "/<$tag>/,/<\/$tag>/p" "$work/certs.ovpn"
-done
+cat "$work/tail"

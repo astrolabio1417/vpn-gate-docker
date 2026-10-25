@@ -5,6 +5,7 @@
 # never leak between assertions and no test ever touches /var/lib.
 set -u
 cd "$(dirname "$0")/.."
+unset SORT_BY
 
 pass=0; fail=0
 check() { # check <description> <condition-result>
@@ -25,8 +26,37 @@ stamp() { date -d "@$(( $(date +%s) + $1 ))" +%Y%m%d%H%M.%S; }
 
 claimed_ip_of() { printf '%s\n' "$1" | grep -m1 '^# claimed ' | awk '{ print $3 }'; }
 
+mkrow() { printf 'evil,%s,%s,1,1000,Japan,JP,0,0,0,0,0,x,,%s\n' "$1" "$2" "$(printf '%s\n' "$3" | base64 | tr -d '\n')"; }
+injected() { printf '%s\n' "$1" | grep -qE '^[[:space:]]*(script-security|up|management)( |$)'; }
+outside_ok() {
+    awk '
+        tag != "" { if ($0 == "</" tag ">") tag = ""; next }
+        /^<(ca|cert|key)>$/ { tag = substr($0, 2, length($0) - 2); next }
+        /^[[:space:]]*$/ || /^#/ { next }
+        /^remote / { n++; next }
+        /^(client|dev tun|nobind|persist-key|resolv-retry infinite|connect-retry 2|connect-retry-max 3|server-poll-timeout 10|ping 10|ping-restart 30|cipher AES-128-CBC|data-ciphers AES-128-CBC:AES-256-GCM:AES-128-GCM|auth SHA1|auth-nocache|verb 3)$/ { next }
+        { bad = 1 }
+        END { exit !(n == 1 && !bad) }' "$1"
+}
+ca='<ca>
+-----BEGIN CERTIFICATE-----
+AAAA
+-----END CERTIFICATE-----
+</ca>'
+certkey='<cert>
+-----BEGIN CERTIFICATE-----
+AAAA
+-----END CERTIFICATE-----
+</cert>
+<key>
+-----BEGIN RSA PRIVATE KEY-----
+AAAA
+-----END RSA PRIVATE KEY-----
+</key>'
+
 sorted_ips=$(awk -F, 'NF==15 && $1 !~ /^[*#]/' test/fixture.csv | sort -t, -k3,3 -nr | cut -d, -f2)
 top_ip=$(printf '%s\n' "$sorted_ips" | sed -n '1p')
+speed_ips=$(awk -F, 'NF==15 && $1 !~ /^[*#]/' test/fixture.csv | sort -t, -k5,5nr -k3,3nr | cut -d, -f2)
 
 d=$(mkclaimdir)
 OUT=$(MAX_SERVERS=5 COUNTRY= CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv); rc=$?
@@ -43,6 +73,9 @@ printf '%s\n' "$OUT" | grep -qE '^remote [0-9.]+ [0-9]+ (tcp|udp)$'; \
 
 claimed=$(claimed_ip_of "$OUT")
 [ -f "$d/$claimed/beat" ]; check "a beat file is created under the claim" "$?"
+
+printf '%s\n' "$OUT" > "$scratch/main.ovpn"
+outside_ok "$scratch/main.ovpn"; check "only comments, HEADER and one remote outside blocks" "$?"
 
 for tag in ca cert key; do
     printf '%s\n' "$OUT" | grep -q "<$tag>" && printf '%s\n' "$OUT" | grep -q "</$tag>"
@@ -81,6 +114,41 @@ all_ips=$(printf '%s\n' "$sorted_ips" | paste -sd,)
 MAX_SERVERS=32 BLOCKED_IPS="$all_ips" CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv >/dev/null 2>&1; rc=$?
 [ "$rc" -ne 0 ]; check "blocking every server exits non-zero" "$?"
 
+# A blocklist that normalises to empty (",", " ", ",,") must be a no-op,
+# not a pool wipe -- NR==FNR on an empty first file stays true forever.
+d=$(mkclaimdir)
+MAX_SERVERS=32 BLOCKED_IPS="," CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; check "BLOCKED_IPS=',' (normalises to empty) claims normally" "$?"
+
+# Trailing-dot token blocks a whole subnet, not just one IP. The fixture's
+# public-vpn-* farm is entirely 219.100.37.0/24; only the two 203.0.113.x
+# rows survive.
+d=$(mkclaimdir)
+PREFIX=$(MAX_SERVERS=32 BLOCKED_IPS="219.100.37." CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv)
+prefix_ip=$(claimed_ip_of "$PREFIX")
+case "$prefix_ip" in
+    219.100.37.*) leaked=1 ;;
+    *) leaked=0 ;;
+esac
+[ "$leaked" -eq 0 ]; check "trailing-dot BLOCKED_IPS=219.100.37. excludes the whole farm (got $prefix_ip)" "$?"
+
+# A full IP with no trailing dot must match exactly, not as a string prefix:
+# 219.100.37.2 must not also swallow 219.100.37.239. Block every candidate
+# except .239 (including the exact .2 token) so a correct implementation is
+# the only way .239 remains claimable.
+d=$(mkclaimdir)
+all_but_239=$(printf '%s\n' "$sorted_ips" | grep -v '^219\.100\.37\.239$' | paste -sd,)
+NOPFX=$(MAX_SERVERS=32 BLOCKED_IPS="$all_but_239" CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv)
+nopfx_ip=$(claimed_ip_of "$NOPFX")
+[ "$nopfx_ip" = "219.100.37.239" ]; check "full-IP token 219.100.37.2 does not prefix-match 219.100.37.239 (got $nopfx_ip)" "$?"
+
+# The exhaustion error path must still fire when a prefix, not just an
+# enumeration of exact IPs, is what empties the pool.
+d=$(mkclaimdir)
+MAX_SERVERS=32 BLOCKED_IPS="219.100.37.,203.0.113.10,203.0.113.20" CLAIM_DIR="$d" \
+    ./generate-config.sh < test/fixture.csv >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; check "a prefix that empties the pool exits non-zero" "$?"
+
 # COUNTRY filter must run before claiming, not after: the fixture's two
 # highest-scored rows are deliberately non-JP, so a regression that let
 # claiming see the unfiltered pool would hand one of them straight out.
@@ -101,6 +169,143 @@ mkdir -p "$d/$top_ip"
 : > "$d/$top_ip/beat"
 MAX_SERVERS=1 CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv >/dev/null 2>&1; rc=$?
 [ "$rc" -ne 0 ]; check "MAX_SERVERS caps the pool (top claimed, MAX_SERVERS=1 can't reach row 2)" "$?"
+
+# --- config validation ---
+
+d=$(mkclaimdir)
+mkrow 198.51.100.7 1 "proto udp
+remote 198.51.100.7 1194
+# <ca>
+script-security 2
+up /bin/sh
+management 0.0.0.0 7505
+# </ca>
+$ca
+$certkey" > "$scratch/v1.csv"
+V=$(MAX_SERVERS=5 COUNTRY= CLAIM_DIR="$d" ./generate-config.sh < "$scratch/v1.csv" 2>/dev/null); rc=$?
+printf '%s\n' "$V" > "$scratch/v1.ovpn"
+ok=1
+[ "$rc" -eq 0 ] || ok=0
+injected "$V" && ok=0
+printf '%s\n' "$V" | grep -q '^# <' && ok=0
+outside_ok "$scratch/v1.ovpn" || ok=0
+[ "$ok" -eq 1 ]; check "comment-wrapped injection yields a clean config" "$?"
+
+for close in ' </ca>' '<cert>'; do
+    d=$(mkclaimdir)
+    mkrow 198.51.100.7 1 "proto udp
+remote 198.51.100.7 1194
+<ca>
+-----BEGIN CERTIFICATE-----
+AAAA
+$close
+script-security 2
+up /bin/sh
+</ca>
+$certkey" > "$scratch/v2.csv"
+    V=$(MAX_SERVERS=5 COUNTRY= CLAIM_DIR="$d" ./generate-config.sh < "$scratch/v2.csv" 2>/dev/null); rc=$?
+    ok=1
+    [ "$rc" -ne 0 ] || ok=0
+    injected "$V" && ok=0
+    [ ! -e "$d/198.51.100.7" ] || ok=0
+    [ "$ok" -eq 1 ]; check "early block close '$close' is rejected" "$?"
+done
+
+d=$(mkclaimdir)
+mkrow 198.51.100.7 1 "proto udp
+remote 203.0.113.9 1194
+$ca
+$certkey" > "$scratch/v3.csv"
+V=$(MAX_SERVERS=5 COUNTRY= CLAIM_DIR="$d" ./generate-config.sh < "$scratch/v3.csv" 2>/dev/null); rc=$?
+ok=1
+[ "$rc" -ne 0 ] || ok=0
+printf '%s\n' "$V" | grep -q '^# claimed' && ok=0
+[ ! -e "$d/198.51.100.7" ] || ok=0
+[ "$ok" -eq 1 ]; check "remote host differing from the row IP is rejected" "$?"
+
+d=$(mkclaimdir)
+{ cat "$scratch/v3.csv" | sed 's/^evil,198.51.100.7,1,/evil,198.51.100.7,2,/'
+  mkrow 198.51.100.8 1 "proto tcp
+remote 198.51.100.8 443
+$ca
+$certkey"; } > "$scratch/v4.csv"
+V=$(MAX_SERVERS=5 COUNTRY= CLAIM_DIR="$d" ./generate-config.sh < "$scratch/v4.csv" 2>/dev/null); rc=$?
+ok=1
+[ "$(claimed_ip_of "$V")" = "198.51.100.8" ] || ok=0
+[ ! -e "$d/198.51.100.7" ] || ok=0
+[ "$ok" -eq 1 ]; check "a mismatched row falls through to the next candidate" "$?"
+
+d=$(mkclaimdir)
+mkrow 198.51.100.07 1 "proto udp
+remote 198.51.100.07 1194
+$ca
+$certkey" > "$scratch/v5.csv"
+V=$(MAX_SERVERS=5 COUNTRY= CLAIM_DIR="$d" ./generate-config.sh < "$scratch/v5.csv" 2>/dev/null); rc=$?
+ok=1
+[ "$rc" -ne 0 ] || ok=0
+[ ! -e "$d/198.51.100.07" ] || ok=0
+[ "$ok" -eq 1 ]; check "a leading-zero (octal) IP is rejected" "$?"
+
+# --- SORT_BY ---
+
+for sb in unset '' score; do
+    d=$(mkclaimdir)
+    if [ "$sb" = unset ]; then
+        sb_out=$(MAX_SERVERS=32 CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv)
+    else
+        sb_out=$(SORT_BY="$sb" MAX_SERVERS=32 CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv)
+    fi
+    sb_ip=$(claimed_ip_of "$sb_out")
+    [ "$sb_ip" = "203.0.113.10" ]; check "SORT_BY=${sb:-<empty>} ranks by score (got $sb_ip)" "$?"
+done
+
+d=$(mkclaimdir)
+sb_out=$(SORT_BY=speed MAX_SERVERS=32 CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv)
+sb_ip=$(claimed_ip_of "$sb_out")
+[ "$sb_ip" = "219.100.37.178" ]; check "SORT_BY=speed claims the fastest relay (got $sb_ip)" "$?"
+
+d=$(mkclaimdir)
+sb_out=$(SORT_BY=speed COUNTRY=JP MAX_SERVERS=32 CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv)
+sb_ip=$(claimed_ip_of "$sb_out")
+[ "$sb_ip" = "219.100.37.178" ]; check "SORT_BY=speed with COUNTRY=JP claims the fastest JP relay (got $sb_ip)" "$?"
+
+d=$(mkclaimdir)
+sb_out=$(SORT_BY=speed BLOCKED_IPS=219.100.37.178 MAX_SERVERS=32 CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv)
+sb_ip=$(claimed_ip_of "$sb_out")
+[ "$sb_ip" = "$(printf '%s\n' "$speed_ips" | sed -n '2p')" ]; check "SORT_BY=speed still honours BLOCKED_IPS (got $sb_ip)" "$?"
+
+d=$(mkclaimdir)
+mkdir -p "$d/219.100.37.178"
+: > "$d/219.100.37.178/beat"
+SORT_BY=speed MAX_SERVERS=1 CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; check "SORT_BY=speed MAX_SERVERS=1 cannot reach past the fastest relay" "$?"
+
+d=$(mkclaimdir)
+sb_seq=""
+i=0
+while [ "$i" -lt 6 ]; do
+    sb_out=$(SORT_BY=speed MAX_SERVERS=32 CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv)
+    sb_seq="$sb_seq$(claimed_ip_of "$sb_out")
+"
+    i=$((i+1))
+done
+sb_seq=$(printf '%s\n' "$sb_seq" | sed '/^$/d')
+sb_distinct=$(printf '%s\n' "$sb_seq" | sort -u | wc -l)
+ok=1
+[ "$sb_distinct" -eq 6 ] || ok=0
+[ "$sb_seq" = "$(printf '%s\n' "$speed_ips" | head -6)" ] || ok=0
+[ "$ok" -eq 1 ]; check "6 sequential SORT_BY=speed runs claim 6 distinct relays in Speed order (distinct=$sb_distinct)" "$?"
+
+for sb in ping Speed foo; do
+    d="$scratch/sortby-$sb"
+    sb_out=$(SORT_BY="$sb" MAX_SERVERS=32 CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv 2>"$scratch/sortby-$sb.err"); rc=$?
+    ok=1
+    [ "$rc" -ne 0 ] || ok=0
+    [ -z "$sb_out" ] || ok=0
+    grep -q "SORT_BY='$sb'" "$scratch/sortby-$sb.err" || ok=0
+    [ ! -e "$d" ] || ok=0
+    [ "$ok" -eq 1 ]; check "SORT_BY=$sb fails before touching CLAIM_DIR" "$?"
+done
 
 # --- claim/steal/tombstone mechanics ---
 

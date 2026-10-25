@@ -5,10 +5,13 @@ set -eu
 
 CONF=/etc/openvpn/vpngate.ovpn
 OVPN_LOG=/tmp/openvpn.log
-API=https://www.vpngate.net/api/iphone/
+SERVER_LIST_URLS="${SERVER_LIST_URLS:-https://www.vpngate.net/api/iphone/,https://raw.githubusercontent.com/GeorgeXie2333/vpngate-list-mirror/main/data/vpngate.csv,https://cdn.jsdelivr.net/gh/GeorgeXie2333/vpngate-list-mirror@latest/data/vpngate.csv}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-30}"
 CHECK_URL="${CHECK_URL:-https://api.ipify.org}"
+BLOCKED_EXIT_IPS="${BLOCKED_EXIT_IPS:-}"
 PROXY_PORT="${PROXY_PORT:-1080}"
+PROXY_DNS="${PROXY_DNS:-1.1.1.1:53/tcp,8.8.8.8:53/tcp}"
+PROXY_DNS_TTL="${PROXY_DNS_TTL:--1s}"
 CLAIM_DIR="${CLAIM_DIR:-/var/lib/vpn-gate/claims}"
 
 ovpn_pid=""
@@ -122,12 +125,24 @@ fi
 
 mkdir -p /etc/openvpn
 log "fetching server list"
-if ! curl -fsS --max-time 60 "$API" -o /tmp/vpngate.csv; then
-    log "ERROR: could not fetch the VPN Gate server list"
+fetched=""
+set -f
+for url in $(printf '%s' "$SERVER_LIST_URLS" | tr -d ' ' | tr ',' '\n' | sed '/^$/d'); do
+    if curl -fsS --connect-timeout 10 --speed-limit 1024 --speed-time 15 --max-time 60 "$url" -o /tmp/vpngate.csv &&
+       head -n1 /tmp/vpngate.csv | grep -q '^\*vpn_servers'; then
+        log "server list from $url"
+        fetched=1
+        break
+    fi
+    log "server list fetch failed: $url"
+done
+set +f
+if [ -z "$fetched" ]; then
+    log "ERROR: could not fetch the VPN Gate server list from any of SERVER_LIST_URLS"
     exit 1
 fi
 
-log "generating config (COUNTRY='${COUNTRY:-any}' MAX_SERVERS=${MAX_SERVERS:-32} CLAIM_DIR='$CLAIM_DIR')"
+log "generating config (COUNTRY='${COUNTRY:-any}' SORT_BY=${SORT_BY:-score} MAX_SERVERS=${MAX_SERVERS:-32} CLAIM_DIR='$CLAIM_DIR')"
 if ! /app/generate-config.sh < /tmp/vpngate.csv > "$CONF"; then
     log "ERROR: could not claim a relay (see generate-config.sh output above)"
     exit 1
@@ -175,7 +190,7 @@ wait_for_tunnel() {
 }
 
 start_proxy() {
-    gost -L ":$PROXY_PORT" &
+    gost -L ":$PROXY_PORT?dns=$PROXY_DNS&ttl=$PROXY_DNS_TTL" &
     gost_pid=$!
     log "proxy listening on :$PROXY_PORT (pid $gost_pid)"
 }
@@ -193,6 +208,13 @@ current_remote() {
         | tail -1 | sed 's/.*\]//'
 }
 
+record_check() {
+    hist="$hist$1"
+    [ "${#hist}" -le 5 ] || hist=${hist#?}
+    fails=$(printf %s "$hist" | tr -d P)
+    fails=${#fails}
+}
+
 start_openvpn
 if ! wait_for_tunnel; then
     give_up "no server came up; exiting so a fresh list and a fresh claim are made"
@@ -201,14 +223,51 @@ log "tunnel up via $(current_remote)"
 
 # The default container resolver dies once `redirect-gateway def1` is pushed,
 # so every proxied lookup fails while the tunnel still looks healthy.
-if ! curl -fsS --max-time 15 "$CHECK_URL" > /dev/null 2>&1; then
-    log "WARNING: DNS/connectivity check failed through the tunnel."
-    log "WARNING: run this container with --dns 1.1.1.1 (compose: dns: [1.1.1.1])."
+if [ -z "$BLOCKED_EXIT_IPS" ]; then
+    # Hot default path, unchanged: no BLOCKED_EXIT_IPS means nothing below
+    # ever compares against exit_ip, so one flaky fetch costs nothing.
+    if ! exit_ip=$(curl -fsS --max-time 15 "$CHECK_URL" 2>/dev/null); then
+        log "WARNING: DNS/connectivity check failed through the tunnel."
+        log "WARNING: run this container with --dns 1.1.1.1 (compose: dns: [1.1.1.1])."
+    fi
+else
+    # BLOCKED_EXIT_IPS asks us to refuse specific exits; that promise is
+    # only as good as the exit IP we can confirm, so this path fails
+    # CLOSED instead of open: retry past one transient failure, and if the
+    # exit IP still cannot be confirmed, refuse to serve rather than let an
+    # unverified relay through.
+    attempt=1
+    exit_ip=""
+    while [ "$attempt" -le 3 ]; do
+        exit_ip=$(curl -fsS --max-time 15 "$CHECK_URL" 2>/dev/null) || exit_ip=""
+        exit_ip=$(printf '%s' "$exit_ip" | tr -d ' \t\n\r')
+        if [ -n "$exit_ip" ]; then
+            break
+        fi
+        if [ "$attempt" -lt 3 ]; then
+            sleep 2
+        fi
+        attempt=$((attempt+1))
+    done
+    if [ -z "$exit_ip" ]; then
+        log "WARNING: DNS/connectivity check failed through the tunnel."
+        log "WARNING: run this container with --dns 1.1.1.1 (compose: dns: [1.1.1.1])."
+        give_up "could not determine exit IP after 3 attempts; refusing to serve with BLOCKED_EXIT_IPS set"
+    fi
+fi
+# CHECK_URL is operator-configurable and may not return a bare IP; trim
+# whitespace/newlines so a well-formed body still compares cleanly, and let
+# anything else pass through silently -- it just will not match a blocklist.
+exit_ip=$(printf '%s' "${exit_ip:-}" | tr -d ' \t\n\r')
+
+if [ -n "$exit_ip" ] && [ -n "$BLOCKED_EXIT_IPS" ] && \
+   printf '%s' "$BLOCKED_EXIT_IPS" | tr -d ' ' | tr ',' '\n' | sed '/^$/d' | grep -qxF "$exit_ip"; then
+    give_up "exit IP $exit_ip (via entry $CLAIMED_IP) is blocked; tombstoned so the restart claims another relay"
 fi
 
 start_proxy
 
-fails=0
+hist=""
 while :; do
     # busybox ash defers a trap until a foreground child exits; backgrounding
     # lets `wait` return as soon as TERM/INT fires instead of after CHECK_INTERVAL.
@@ -232,12 +291,12 @@ while :; do
 
     if curl -fsS --max-time 10 --socks5-hostname "127.0.0.1:$PROXY_PORT" \
             "$CHECK_URL" > /dev/null 2>&1; then
-        fails=0
+        record_check P
         continue
     fi
-    fails=$((fails+1))
-    log "proxy check failed ($fails/3)"
+    record_check F
+    log "proxy check failed ($fails/3 in last 5)"
     if [ "$fails" -ge 3 ]; then
-        give_up "proxy checks failed 3 times in a row; exiting so a fresh claim is made"
+        give_up "proxy checks failed 3 of the last 5; exiting so a fresh claim is made"
     fi
 done
