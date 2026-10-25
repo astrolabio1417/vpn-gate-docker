@@ -26,6 +26,34 @@ stamp() { date -d "@$(( $(date +%s) + $1 ))" +%Y%m%d%H%M.%S; }
 
 claimed_ip_of() { printf '%s\n' "$1" | grep -m1 '^# claimed ' | awk '{ print $3 }'; }
 
+mkrow() { printf 'evil,%s,%s,1,1000,Japan,JP,0,0,0,0,0,x,,%s\n' "$1" "$2" "$(printf '%s\n' "$3" | base64 | tr -d '\n')"; }
+injected() { printf '%s\n' "$1" | grep -qE '^[[:space:]]*(script-security|up|management)( |$)'; }
+outside_ok() {
+    awk '
+        tag != "" { if ($0 == "</" tag ">") tag = ""; next }
+        /^<(ca|cert|key)>$/ { tag = substr($0, 2, length($0) - 2); next }
+        /^[[:space:]]*$/ || /^#/ { next }
+        /^remote / { n++; next }
+        /^(client|dev tun|nobind|persist-key|resolv-retry infinite|connect-retry 2|connect-retry-max 3|server-poll-timeout 10|ping 10|ping-restart 30|cipher AES-128-CBC|data-ciphers AES-128-CBC:AES-256-GCM:AES-128-GCM|auth SHA1|auth-nocache|verb 3)$/ { next }
+        { bad = 1 }
+        END { exit !(n == 1 && !bad) }' "$1"
+}
+ca='<ca>
+-----BEGIN CERTIFICATE-----
+AAAA
+-----END CERTIFICATE-----
+</ca>'
+certkey='<cert>
+-----BEGIN CERTIFICATE-----
+AAAA
+-----END CERTIFICATE-----
+</cert>
+<key>
+-----BEGIN RSA PRIVATE KEY-----
+AAAA
+-----END RSA PRIVATE KEY-----
+</key>'
+
 sorted_ips=$(awk -F, 'NF==15 && $1 !~ /^[*#]/' test/fixture.csv | sort -t, -k3,3 -nr | cut -d, -f2)
 top_ip=$(printf '%s\n' "$sorted_ips" | sed -n '1p')
 speed_ips=$(awk -F, 'NF==15 && $1 !~ /^[*#]/' test/fixture.csv | sort -t, -k5,5nr -k3,3nr | cut -d, -f2)
@@ -45,6 +73,9 @@ printf '%s\n' "$OUT" | grep -qE '^remote [0-9.]+ [0-9]+ (tcp|udp)$'; \
 
 claimed=$(claimed_ip_of "$OUT")
 [ -f "$d/$claimed/beat" ]; check "a beat file is created under the claim" "$?"
+
+printf '%s\n' "$OUT" > "$scratch/main.ovpn"
+outside_ok "$scratch/main.ovpn"; check "only comments, HEADER and one remote outside blocks" "$?"
 
 for tag in ca cert key; do
     printf '%s\n' "$OUT" | grep -q "<$tag>" && printf '%s\n' "$OUT" | grep -q "</$tag>"
@@ -138,6 +169,82 @@ mkdir -p "$d/$top_ip"
 : > "$d/$top_ip/beat"
 MAX_SERVERS=1 CLAIM_DIR="$d" ./generate-config.sh < test/fixture.csv >/dev/null 2>&1; rc=$?
 [ "$rc" -ne 0 ]; check "MAX_SERVERS caps the pool (top claimed, MAX_SERVERS=1 can't reach row 2)" "$?"
+
+# --- config validation ---
+
+d=$(mkclaimdir)
+mkrow 198.51.100.7 1 "proto udp
+remote 198.51.100.7 1194
+# <ca>
+script-security 2
+up /bin/sh
+management 0.0.0.0 7505
+# </ca>
+$ca
+$certkey" > "$scratch/v1.csv"
+V=$(MAX_SERVERS=5 COUNTRY= CLAIM_DIR="$d" ./generate-config.sh < "$scratch/v1.csv" 2>/dev/null); rc=$?
+printf '%s\n' "$V" > "$scratch/v1.ovpn"
+ok=1
+[ "$rc" -eq 0 ] || ok=0
+injected "$V" && ok=0
+printf '%s\n' "$V" | grep -q '^# <' && ok=0
+outside_ok "$scratch/v1.ovpn" || ok=0
+[ "$ok" -eq 1 ]; check "comment-wrapped injection yields a clean config" "$?"
+
+for close in ' </ca>' '<cert>'; do
+    d=$(mkclaimdir)
+    mkrow 198.51.100.7 1 "proto udp
+remote 198.51.100.7 1194
+<ca>
+-----BEGIN CERTIFICATE-----
+AAAA
+$close
+script-security 2
+up /bin/sh
+</ca>
+$certkey" > "$scratch/v2.csv"
+    V=$(MAX_SERVERS=5 COUNTRY= CLAIM_DIR="$d" ./generate-config.sh < "$scratch/v2.csv" 2>/dev/null); rc=$?
+    ok=1
+    [ "$rc" -ne 0 ] || ok=0
+    injected "$V" && ok=0
+    [ ! -e "$d/198.51.100.7" ] || ok=0
+    [ "$ok" -eq 1 ]; check "early block close '$close' is rejected" "$?"
+done
+
+d=$(mkclaimdir)
+mkrow 198.51.100.7 1 "proto udp
+remote 203.0.113.9 1194
+$ca
+$certkey" > "$scratch/v3.csv"
+V=$(MAX_SERVERS=5 COUNTRY= CLAIM_DIR="$d" ./generate-config.sh < "$scratch/v3.csv" 2>/dev/null); rc=$?
+ok=1
+[ "$rc" -ne 0 ] || ok=0
+printf '%s\n' "$V" | grep -q '^# claimed' && ok=0
+[ ! -e "$d/198.51.100.7" ] || ok=0
+[ "$ok" -eq 1 ]; check "remote host differing from the row IP is rejected" "$?"
+
+d=$(mkclaimdir)
+{ cat "$scratch/v3.csv" | sed 's/^evil,198.51.100.7,1,/evil,198.51.100.7,2,/'
+  mkrow 198.51.100.8 1 "proto tcp
+remote 198.51.100.8 443
+$ca
+$certkey"; } > "$scratch/v4.csv"
+V=$(MAX_SERVERS=5 COUNTRY= CLAIM_DIR="$d" ./generate-config.sh < "$scratch/v4.csv" 2>/dev/null); rc=$?
+ok=1
+[ "$(claimed_ip_of "$V")" = "198.51.100.8" ] || ok=0
+[ ! -e "$d/198.51.100.7" ] || ok=0
+[ "$ok" -eq 1 ]; check "a mismatched row falls through to the next candidate" "$?"
+
+d=$(mkclaimdir)
+mkrow 198.51.100.07 1 "proto udp
+remote 198.51.100.07 1194
+$ca
+$certkey" > "$scratch/v5.csv"
+V=$(MAX_SERVERS=5 COUNTRY= CLAIM_DIR="$d" ./generate-config.sh < "$scratch/v5.csv" 2>/dev/null); rc=$?
+ok=1
+[ "$rc" -ne 0 ] || ok=0
+[ ! -e "$d/198.51.100.07" ] || ok=0
+[ "$ok" -eq 1 ]; check "a leading-zero (octal) IP is rejected" "$?"
 
 # --- SORT_BY ---
 

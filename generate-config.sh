@@ -308,46 +308,49 @@ claim_ip() {
 }
 
 claimed_ip=""
-remote_line=""
 while IFS= read -r row; do
     ip=$(printf '%s' "$row" | cut -d, -f2)
 
     # CSV data must never name a path. A malformed IP field is skipped, not
     # sanitized -- there is no safe way to claim a path we cannot trust.
-    if ! printf '%s' "$ip" | grep -Eq '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'; then
+    if ! printf '%s' "$ip" | grep -Eq '^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$'; then
         continue
     fi
 
     is_tombstoned "$ip" && continue
-    claim_ip "$ip" || continue
 
     printf '%s' "$row" | cut -d, -f15 | base64 -d 2>/dev/null | tr -d '\r' \
         > "$work/one.ovpn" 2>/dev/null || true
 
-    hp=""
-    pr=""
-    if [ -s "$work/one.ovpn" ]; then
-        # Protocols are mixed across servers; never assume tcp.
-        hp=$(awk '/^remote /{ print $2" "$3; exit }' "$work/one.ovpn")
-        pr=$(awk '/^proto /{ print tolower($2); exit }' "$work/one.ovpn")
-    fi
+    awk -v ip="$ip" '
+        tag != "" {
+            if ($0 == ("</" tag ">")) { blk[tag] = blk[tag] $0 "\n"; tag = ""; next }
+            if ($0 ~ /^-----(BEGIN|END) [A-Z ]+-----$/ || $0 ~ "^[A-Za-z0-9+/=]*$") { blk[tag] = blk[tag] $0 "\n"; next }
+            bad = 1; exit
+        }
+        /^<(ca|cert|key)>$/ {
+            tag = substr($0, 2, length($0) - 2)
+            if (tag in blk) { bad = 1; exit }
+            blk[tag] = $0 "\n"; next
+        }
+        /^remote / && host == "" { host = $2; port = $3 }
+        /^proto / && proto == "" { proto = tolower($2) }
+        END {
+            if (bad || tag != "" || host != ip || port !~ /^[0-9]+$/ || (proto != "tcp" && proto != "udp")) exit 1
+            if (!("ca" in blk) || !("cert" in blk) || !("key" in blk)) exit 1
+            print "remote " host " " port " " proto
+            print ""
+            printf "%s%s%s", blk["ca"], blk["cert"], blk["key"]
+        }' "$work/one.ovpn" > "$work/tail" || continue
 
-    if [ -z "$hp" ] || [ -z "$pr" ]; then
-        # Our decode failed, not the relay -- release rather than
-        # tombstone, since a tombstone is a claim about relay health.
-        rm -rf "$CLAIM_DIR/$ip" 2>/dev/null || true
-        continue
-    fi
-
+    claim_ip "$ip" || continue
     claimed_ip="$ip"
     owner_token=$(cat "$CLAIM_DIR/$ip/owner" 2>/dev/null) || owner_token=""
-    remote_line="remote $hp $pr"
-    cp "$work/one.ovpn" "$work/certs.ovpn"
     break
 done < "$work/top.csv"
 
 if [ -z "$claimed_ip" ]; then
-    echo "generate-config: could not claim a relay -- every candidate in the top $MAX_SERVERS was tombstoned, held by another container, or undecodable" >&2
+    echo "generate-config: could not claim a relay -- every candidate in the top $MAX_SERVERS was tombstoned, held by another container, or invalid" >&2
     exit 1
 fi
 
@@ -377,9 +380,4 @@ verb 3
 HEADER
 
 echo
-echo "$remote_line"
-echo
-# All servers ship an identical CA/cert/key.
-for tag in ca cert key; do
-    sed -n "/<$tag>/,/<\/$tag>/p" "$work/certs.ovpn"
-done
+cat "$work/tail"
