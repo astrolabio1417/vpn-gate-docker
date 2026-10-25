@@ -5,7 +5,7 @@ set -eu
 
 CONF=/etc/openvpn/vpngate.ovpn
 OVPN_LOG=/tmp/openvpn.log
-API=https://www.vpngate.net/api/iphone/
+SERVER_LIST_URLS="${SERVER_LIST_URLS:-https://www.vpngate.net/api/iphone/,https://raw.githubusercontent.com/GeorgeXie2333/vpngate-list-mirror/main/data/vpngate.csv,https://cdn.jsdelivr.net/gh/GeorgeXie2333/vpngate-list-mirror@latest/data/vpngate.csv}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-30}"
 CHECK_URL="${CHECK_URL:-https://api.ipify.org}"
 BLOCKED_EXIT_IPS="${BLOCKED_EXIT_IPS:-}"
@@ -125,8 +125,20 @@ fi
 
 mkdir -p /etc/openvpn
 log "fetching server list"
-if ! curl -fsS --max-time 60 "$API" -o /tmp/vpngate.csv; then
-    log "ERROR: could not fetch the VPN Gate server list"
+fetched=""
+set -f
+for url in $(printf '%s' "$SERVER_LIST_URLS" | tr -d ' ' | tr ',' '\n' | sed '/^$/d'); do
+    if curl -fsS --connect-timeout 10 --speed-limit 1024 --speed-time 15 --max-time 60 "$url" -o /tmp/vpngate.csv &&
+       head -n1 /tmp/vpngate.csv | grep -q '^\*vpn_servers'; then
+        log "server list from $url"
+        fetched=1
+        break
+    fi
+    log "server list fetch failed: $url"
+done
+set +f
+if [ -z "$fetched" ]; then
+    log "ERROR: could not fetch the VPN Gate server list from any of SERVER_LIST_URLS"
     exit 1
 fi
 
